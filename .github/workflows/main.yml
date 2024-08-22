@@ -1,0 +1,113 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main"]
+
+jobs:
+  ecr-repo-check:
+    runs-on: ubuntu-latest 
+    environment: dev
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Convert Repo Name to Lowercase
+        id: downcase-repo
+        run: |
+          echo "ECR_REPOSITORY_NAME=${GITHUB_REPOSITORY@L}" >> $GITHUB_OUTPUT
+      
+      - name: Check if ECR repository exists
+        id: ecr-repo
+        run: |
+          export REPOSITORY=$(aws ecr describe-repositories --region $AWS_REGION --repository-names ${{ steps.downcase-repo.outputs.ECR_REPOSITORY_NAME }} --query "repositories[].repositoryName" --output text 2> /dev/null)
+          if [ -z "$REPOSITORY" ]; then
+            echo "[INFO] Repository doesn't exist"
+            echo "[INFO] Creating repository..."
+            aws ecr create-repository --repository-name ${{ steps.downcase-repo.outputs.ECR_REPOSITORY_NAME }} --region $AWS_REGION
+          else
+            echo "[INFO] Repository already exists"
+          fi
+          
+  docker-build:
+    name: Docker Build Image
+    runs-on: ubuntu-latest
+    environment: dev
+    needs: ecr-repo-check
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Convert Repo URL to Lowercase
+        id: downcase-repo
+        run: |
+          echo "ECR_REPOSITORY_URL=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${GITHUB_REPOSITORY@L}" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        run: |
+          # Build a docker container and
+          # push it to ECR so that it can
+          # be deployed to ECS.
+          docker build -t ${{ steps.downcase-repo.outputs.ECR_REPOSITORY_URL }}:${{ github.sha }} .
+          docker push ${{ steps.downcase-repo.outputs.ECR_REPOSITORY_URL }}:${{ github.sha }}
+
+  
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    environment: dev
+    needs: docker-build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Convert Repo URL to Lowercase
+        id: downcase-repo
+        run: |
+          echo "ECR_REPOSITORY_URL=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${GITHUB_REPOSITORY@L}" >> $GITHUB_OUTPUT
+      
+      - name: executing remote ssh commands using ssh key
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.KEY }}
+          script: |
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+            sudo docker rm -f ${{ github.ref_name }}-${{ vars.CONTAINER_NAME }}
+            sudo docker run \
+              -d \
+              -p ${{ vars.PORT }}:${{ vars.PORT }} \
+              --restart unless-stopped \
+              --name ${{ github.ref_name }}-${{ vars.CONTAINER_NAME }} \
+              ${{ steps.downcase-repo.outputs.ECR_REPOSITORY_URL }}:${{ github.sha }}
